@@ -15,9 +15,14 @@ import fire
 
 # Sample a partial window of length<n_ctx with tokens_to_sample new tokens on level=level
 def sample_partial_window(zs, labels, sampling_kwargs, level, prior, tokens_to_sample, hps):
+    if hps.hop_fraction[level] == 1 and level != hps.levels - 1:
+        n_ctx = prior.n_ctx * sampling_kwargs['max_batch_size']
+    else:
+        n_ctx = prior.n_ctx
+        
     z = zs[level]
-    n_ctx = prior.n_ctx
     current_tokens = z.shape[1]
+
     if current_tokens < n_ctx - tokens_to_sample:
         sampling_kwargs['sample_tokens'] = current_tokens + tokens_to_sample
         start = 0
@@ -27,14 +32,65 @@ def sample_partial_window(zs, labels, sampling_kwargs, level, prior, tokens_to_s
 
     return sample_single_window(zs, labels, sampling_kwargs, level, prior, start, hps)
 
+# blah, im tierd, how spell
+def _speed_single_window(zs, labels, sampling_kwargs, level, prior, start, hps):
+    batch_size = sampling_kwargs['max_batch_size']
+    hop_length = int(hps.hop_fraction[level] * prior.n_ctx) * batch_size
+    
+    # ensure full context is generated when in speed mode
+    # _sample_single_window will assume full context if sample_tokens don't exist in sampling_kwargs
+    if 'sample_tokens' in sampling_kwargs:
+        del sampling_kwargs['sample_tokens']
+    
+    batches = []
+    for batch in range(hps.n_samples):
+        tz = [t.zeros((0,)) for _ in range(hps.levels)]
+
+        current_tokens = zs[level][batch, max(0, start) : start + hop_length].shape[0]
+        overflow_batches = current_tokens // (prior.n_ctx)
+        
+        #ToDo: change these 4s to hps.downcond or whatever its named
+        tz[level + 1] = zs[level + 1][batch, max(0, start // 4) : (start + hop_length) // 4]
+        
+        # cut out already fully generated batches, and clip to multiple of context if too short
+        tz[level + 1] = tz[level + 1][overflow_batches * (prior.n_ctx // 4) : tz[level + 1].shape[0] - (tz[level + 1].shape[0] % (prior.n_ctx // 4))].reshape((-1, prior.n_ctx // 4))
+        new_batch = tz[level + 1].shape[0]
+
+        print(start, current_tokens, overflow_batches)
+
+        if new_batch > 0:
+            tz[level] = t.zeros((new_batch, 0), dtype=zs[level].dtype)
+            
+            new_labels = {
+                'info': [labels['info'][batch]] * new_batch,
+                'y': t.stack([labels['y'][batch, :] for _ in range(new_batch)], dim=0)
+            }
+            
+            sampling_kwargs['max_batch_size'] = batch_size
+            tz = _sample_single_window(tz, new_labels, sampling_kwargs, level, prior, 0, hps)
+
+            batches.append(tz[level].reshape((-1,))[current_tokens - overflow_batches * prior.n_ctx:])
+    if new_batch > 0 :
+        zs[level] = t.cat((zs[level], t.stack(batches, dim=0)), dim=1)
+    return zs
+
+# !Wrapper/Shadow function!
 # Sample a single window of length=n_ctx at position=start on level=level
 def sample_single_window(zs, labels, sampling_kwargs, level, prior, start, hps):
+    if hps.hop_fraction[level] == 1 and level != hps.levels - 1:
+        return _speed_single_window(zs, labels, sampling_kwargs, level, prior, start, hps)
+    else:
+        return _sample_single_window(zs, labels, sampling_kwargs, level, prior, start, hps)
+
+# Sample a single window of length=n_ctx at position=start on level=level
+def _sample_single_window(zs, labels, sampling_kwargs, level, prior, start, hps):
     n_samples = hps.n_samples
     n_ctx = prior.n_ctx
     end = start + n_ctx
-
+    
+    zs = [ z.cpu() for z in zs ] # force tokens onto ram incase it was created externally
     # get z already sampled at current level
-    z = zs[level][:,start:end]
+    z = zs[level][:,start:end].cuda()
 
     if 'sample_tokens' in sampling_kwargs:
         # Support sampling a window shorter than n_ctx
@@ -51,6 +107,10 @@ def sample_single_window(zs, labels, sampling_kwargs, level, prior, start, hps):
     
     # get z_conds from level above
     z_conds = prior.get_z_conds(zs, start, end)
+    
+    if z_conds != None:
+        for k in range(len(z_conds)):
+            z_conds[k] = z_conds[k].cuda()
 
     # set y offset, sample_length and lyrics tokens
     y = prior.get_y(labels, start)
@@ -73,15 +133,27 @@ def sample_single_window(zs, labels, sampling_kwargs, level, prior, start, hps):
     sampling_kwargs['max_batch_size'] = max_batch_size
 
     # Update z with new sample
-    z_new = z[:,-new_tokens:]
+    z_new = z[:,-new_tokens:].cpu()
+    del z
+    del y
     zs[level] = t.cat([zs[level], z_new], dim=1)
     return zs
 
 # Sample total_length tokens at level=level with hop_length=hop_length
 def sample_level(zs, labels, sampling_kwargs, level, prior, total_length, hop_length, hps):
     print_once(f"Sampling level {level}")
+    
+    if hps.hop_fraction[level] == 1 and level != hps.levels - 1:
+        print('hop_fraction 1 detected, enabling speed upsampling')
+        print('thank me later, -MichaelsLab')
+        # to speed up sampling we simply break up the batches and paralellize within them as new batches
+        batch_size = sampling_kwargs['max_batch_size']
+        hop_length *= batch_size
+    else:
+        batch_size = 1
+    
     if total_length >= prior.n_ctx:
-        for start in get_starts(total_length, prior.n_ctx, hop_length):
+        for start in get_starts(total_length, prior.n_ctx * batch_size, hop_length):
             zs = sample_single_window(zs, labels, sampling_kwargs, level, prior, start, hps)
     else:
         zs = sample_partial_window(zs, labels, sampling_kwargs, level, prior, total_length, hps)
@@ -101,7 +173,9 @@ def _sample(zs, labels, sampling_kwargs, priors, sample_levels, hps):
         hop_length = int(hps.hop_fraction[level]*prior.n_ctx)
         zs = sample_level(zs, labels[level], sampling_kwargs[level], level, prior, total_length, hop_length, hps)
 
-        prior.cpu()
+        # yeah... that aint gonna fly at 12gb ram and 15gb model
+        if level != 2:
+            prior.cpu()
         empty_cache()
 
         # Decode sample
@@ -115,15 +189,15 @@ def _sample(zs, labels, sampling_kwargs, priors, sample_levels, hps):
             os.makedirs(logdir)
         t.save(dict(zs=zs, labels=labels, sampling_kwargs=sampling_kwargs, x=x), f"{logdir}/data.pth.tar")
         save_wav(logdir, x, hps.sr)
-        if alignments is None and priors[-1] is not None and priors[-1].n_tokens > 0 and not isinstance(priors[-1].labeller, EmptyLabeller):
-            alignments = get_alignment(x, zs, labels[-1], priors[-1], sampling_kwargs[-1]['fp16'], hps)
-        save_html(logdir, x, zs, labels[-1], alignments, hps)
+        #if alignments is None and priors[-1] is not None and priors[-1].n_tokens > 0 and not isinstance(priors[-1].labeller, EmptyLabeller):
+        #    alignments = get_alignment(x, zs, labels[-1], priors[-1], sampling_kwargs[-1]['fp16'], hps)
+        save_html(logdir, x, zs, labels[-1], None, hps)
     return zs
 
 # Generate ancestral samples given a list of artists and genres
 def ancestral_sample(labels, sampling_kwargs, priors, hps):
     sample_levels = list(range(len(priors)))
-    zs = [t.zeros(hps.n_samples,0,dtype=t.long, device='cuda') for _ in range(len(priors))]
+    zs = [t.zeros(hps.n_samples,0,dtype=t.long, device='cpu') for _ in range(len(priors))]
     zs = _sample(zs, labels, sampling_kwargs, priors, sample_levels, hps)
     return zs
 
@@ -136,6 +210,12 @@ def continue_sample(zs, labels, sampling_kwargs, priors, hps):
 # Upsample given already generated upper-level codes
 def upsample(zs, labels, sampling_kwargs, priors, hps):
     sample_levels = list(range(len(priors) - 1))
+    
+    # force all priors back to cpu before doing standard upsampling
+    for key, level in enumerate(reversed(sample_levels)):
+        if key != 0:
+            priors[level] = priors[level].cpu()
+        
     zs = _sample(zs, labels, sampling_kwargs, priors, sample_levels, hps)
     return zs
 
@@ -157,13 +237,13 @@ def load_prompts(audio_files, duration, hps):
         xs.extend(xs)
     xs = xs[:hps.n_samples]
     x = t.stack([t.from_numpy(x) for x in xs])
-    x = x.to('cuda', non_blocking=True)
+    #x = x.to('cuda', non_blocking=True)
     return x
 
 # Load codes from previous sampling run
 def load_codes(codes_file, duration, priors, hps):
     data = t.load(codes_file, map_location='cpu')
-    zs = [z.cuda() for z in data['zs']]
+    zs = [z for z in data['zs']]
     assert zs[-1].shape[0] == hps.n_samples, f"Expected bs = {hps.n_samples}, got {zs[-1].shape[0]}"
     del data
     if duration is not None:
